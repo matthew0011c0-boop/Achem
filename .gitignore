@@ -1,0 +1,9 @@
+data/
+*.nc
+*.nc4
+*.log
+manifest.json
+.netrc
+__pycache__/
+*.pyc
+.venv/

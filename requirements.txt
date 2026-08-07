@@ -1,0 +1,4 @@
+earthaccess>=0.10
+harmony-py>=0.4.14
+python-dateutil>=2.8
+tqdm>=4.66
