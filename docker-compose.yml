@@ -1,0 +1,9 @@
+services:
+  tempo:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    # Extra args after the image's default CMD ["--start", "2023-08-01"],
+    # e.g. `docker compose run tempo --start 2023-08-01 --end 2023-12-31`.

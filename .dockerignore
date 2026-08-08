@@ -1,0 +1,8 @@
+.git
+data/
+__pycache__/
+*.pyc
+.venv/
+*.nc
+*.nc4
+*.tif
