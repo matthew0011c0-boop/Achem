@@ -51,6 +51,26 @@ To run this unattended in AWS (self-terminating EC2, optionally split
 across multiple Earthdata accounts) instead of on your own machine, see
 [`docs/AWS_DEPLOY.md`](docs/AWS_DEPLOY.md).
 
+### Running in a container
+
+The `Dockerfile` in this repo packages the exact runtime (Python 3.11 +
+`requirements.txt`) the scripts need - no system GDAL/HDF5 install required,
+since `rasterio`/`netCDF4`/`pyproj` ship those bundled in their wheels.
+
+```bash
+cp .env.example .env   # fill in EARTHDATA_USERNAME/PASSWORD + AWS creds
+docker compose run tempo --start 2023-08-01 --end 2023-12-31
+```
+
+`docker-entrypoint.sh` writes `~/.netrc` inside the container from
+`EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, and `boto3` picks up
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION` from the
+same `.env` automatically - no other setup needed. Downloaded files land in
+`./data` on the host (mounted into `/app/data`). This is the same image
+used for the throwaway-EC2 deployment in
+[`docs/AWS_DEPLOY.md`](docs/AWS_DEPLOY.md), just runnable locally or on any
+other container platform.
+
 ## 2. Run
 
 ```bash
