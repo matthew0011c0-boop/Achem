@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -212,6 +213,15 @@ def main() -> int:
         print("Not authenticated. Run scripts/setup_earthdata_auth.py, or set "
               "EARTHDATA_USERNAME/EARTHDATA_PASSWORD env vars, first.", file=sys.stderr)
         return 1
+
+    # harmony-py (used below for the actual granule downloads) reads its own
+    # EDL_USERNAME/EDL_PASSWORD env vars rather than earthaccess's, and
+    # earthaccess's "environment" login strategy doesn't write ~/.netrc - so
+    # without this, EARTHDATA_USERNAME/PASSWORD alone passes the check above
+    # but then fails inside Harmony with an opaque non-JSON-response error.
+    if os.environ.get("EARTHDATA_USERNAME") and os.environ.get("EARTHDATA_PASSWORD"):
+        os.environ.setdefault("EDL_USERNAME", os.environ["EARTHDATA_USERNAME"])
+        os.environ.setdefault("EDL_PASSWORD", os.environ["EARTHDATA_PASSWORD"])
 
     concept_id = resolve_concept_id(args.short_name, args.version)
     collection = Collection(id=concept_id)
