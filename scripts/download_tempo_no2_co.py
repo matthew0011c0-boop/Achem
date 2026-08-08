@@ -120,6 +120,7 @@ def process_chunk(
     bucket: str | None = None,
     bucket_prefix: str = DEFAULT_BUCKET_PREFIX,
     max_retries: int = 3,
+    delete_local_after_upload: bool = False,
 ) -> str:
     key = chunk_start.isoformat()
     entry = manifest.setdefault(key, {"status": "pending"})
@@ -208,6 +209,15 @@ def process_chunk(
                 entry["s3_keys"] = s3_keys
                 upload_note = f", uploaded to s3://{bucket}/"
 
+                # S3 is already the source of truth for resume (bucket-first check
+                # above), so once a month's files are confirmed uploaded, the local
+                # copies are redundant - only worth keeping disk space for on a
+                # sandbox/cloud runner with limited storage.
+                if delete_local_after_upload:
+                    for f in files + tif_files:
+                        Path(f).unlink(missing_ok=True)
+                    upload_note += ", local copies deleted"
+
             save_manifest(manifest_path, manifest)
             return (f"{key}: downloaded {len(files)} file(s), regridded {len(tif_files)} to 1km GeoTIFF "
                     f"-> {dest}{upload_note}")
@@ -245,6 +255,11 @@ def main() -> int:
     parser.add_argument("--no-bucket", action="store_true",
                          help="Disable S3 entirely; fall back to the local manifest only "
                               "(this turns off the on/off resume-from-bucket behavior).")
+    parser.add_argument("--delete-local-after-upload", action="store_true",
+                         help="Delete a month's local .nc/.tif files once they're confirmed "
+                              "uploaded to S3 (S3 is already the resume source of truth, so "
+                              "nothing is lost). Recommended on disk-constrained cloud "
+                              "sandboxes; has no effect with --no-bucket.")
     args = parser.parse_args()
 
     if args.end < args.start:
@@ -284,6 +299,7 @@ def main() -> int:
             pool.submit(
                 process_chunk, client, collection, cs, ce, out_dir, manifest_path, manifest,
                 s3_client, args.bucket, args.bucket_prefix,
+                delete_local_after_upload=args.delete_local_after_upload,
             ): cs
             for cs, ce in chunks
         }

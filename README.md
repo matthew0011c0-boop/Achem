@@ -49,7 +49,9 @@ secrets are stored in this repo.
 
 To run this unattended in AWS (self-terminating EC2, optionally split
 across multiple Earthdata accounts) instead of on your own machine, see
-[`docs/AWS_DEPLOY.md`](docs/AWS_DEPLOY.md).
+[`docs/AWS_DEPLOY.md`](docs/AWS_DEPLOY.md). To run it inside a Nous
+(Hermes Agent) cloud sandbox instead, see
+[`docs/NOUS_CLOUD.md`](docs/NOUS_CLOUD.md).
 
 ## 2. Run
 

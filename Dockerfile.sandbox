@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+# rasterio/pyproj/netCDF4 ship manylinux wheels with GDAL/PROJ/HDF5/netCDF
+# bundled, so no system geo libraries need to be installed separately here.
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY scripts/ scripts/
+
+# Unlike the main Dockerfile (which runs the downloader once and exits, for
+# a run-to-completion job), this image is meant for Hermes Agent's
+# terminal.backend: docker sandbox, which reuses one long-lived container
+# across many separate tool-call commands. So: no ENTRYPOINT that runs the
+# script immediately - just idle with deps and code already in place, and
+# let the agent exec whatever command it needs (setup_earthdata_auth.py,
+# use_earthdata_account.py, download_tempo_no2_co.py, ...) into it.
+CMD ["sleep", "infinity"]
