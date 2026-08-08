@@ -17,9 +17,10 @@ running from elsewhere.
 - An AWS account with permission to create IAM roles, EC2 instances, an
   ECR repo, and Secrets Manager secrets.
 - Docker installed wherever you build the image.
-- At least one NASA Earthdata Login account (urs.earthdata.nasa.gov). See
-  [Splitting across multiple Earthdata accounts](#splitting-across-multiple-earthdata-accounts)
-  below for whether you actually need more than one.
+- At least one NASA Earthdata Login account (urs.earthdata.nasa.gov). Three
+  are available here - `matthew0011c0`, `matthew0011c1`, `matthew0011c2` -
+  see [Splitting across multiple Earthdata accounts](#splitting-across-multiple-earthdata-accounts)
+  below for whether it's actually worth using more than one.
 
 Substitute your own values for `<ACCOUNT_ID>` and adjust `us-west-2` if
 you deploy elsewhere.
@@ -43,10 +44,16 @@ The container's entrypoint (`docker-entrypoint.sh`) writes `~/.netrc` from
 `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD` env vars at startup - nothing
 NASA-related is baked into the image.
 
+Three Earthdata Login accounts are in play: `matthew0011c0`,
+`matthew0011c1`, `matthew0011c2`. One secret each, never typed into chat -
+run these yourself with the real passwords filled in:
+
 ```bash
-aws secretsmanager create-secret --region us-west-2 \
-  --name achem/earthdata/account-a \
-  --secret-string '{"username":"YOUR_EDL_USERNAME","password":"YOUR_EDL_PASSWORD"}'
+for user in matthew0011c0 matthew0011c1 matthew0011c2; do
+  aws secretsmanager create-secret --region us-west-2 \
+    --name "achem/earthdata/${user}" \
+    --secret-string "{\"username\":\"${user}\",\"password\":\"REPLACE_ME\"}"
+done
 ```
 
 ## 3. IAM role for the instance
@@ -127,7 +134,7 @@ systemctl start docker
 
 REGION=us-west-2
 ACCOUNT_ID=<ACCOUNT_ID>
-SECRET_ID=achem/earthdata/account-a
+SECRET_ID=achem/earthdata/matthew0011c0
 START=2023-08-01
 END=2026-08-07
 
@@ -199,20 +206,45 @@ Whether this actually helps depends on what's limiting you:
   limit is worth avoiding regardless of whether it's technically possible.
 
 If you do want to split it: run three of the instances above in parallel,
-each pointed at a **different secret** (`achem/earthdata/account-a/b/c`)
-and a **non-overlapping date range** - not the same range racing each
-other. Since ranges don't overlap, there's no risk of two accounts
-submitting duplicate Harmony jobs for the same month:
+each pointed at a **different secret** and a **non-overlapping date
+range** - not the same range racing each other. Since ranges don't
+overlap, there's no risk of two accounts submitting duplicate Harmony jobs
+for the same month:
 
-| Instance | Secret                        | `--start`    | `--end`      |
-|----------|--------------------------------|--------------|--------------|
-| A        | `achem/earthdata/account-a`   | 2023-08-01   | 2024-07-31   |
-| B        | `achem/earthdata/account-b`   | 2024-08-01   | 2025-07-31   |
-| C        | `achem/earthdata/account-c`   | 2025-08-01   | 2026-08-07   |
+| Instance | Secret                              | `--start`    | `--end`      |
+|----------|--------------------------------------|--------------|--------------|
+| A        | `achem/earthdata/matthew0011c0`     | 2023-08-01   | 2024-07-31   |
+| B        | `achem/earthdata/matthew0011c1`     | 2024-08-01   | 2025-07-31   |
+| C        | `achem/earthdata/matthew0011c2`     | 2025-08-01   | 2026-08-07   |
 
 All three upload into the same bucket/prefix, so the result is identical
 to one long sequential run - just three independent `user-data.sh` copies
 with `SECRET_ID`/`START`/`END` changed, and three `run-instances` calls.
+
+### Actually measuring "is it faster" before committing to the full split
+
+Don't run the full ~3-year backfill three times over just to time it -
+run a small, fair, apples-to-apples comparison first:
+
+1. **Baseline** - one account, three recent months, sequential (normal
+   single-account behavior): `SECRET_ID=achem/earthdata/matthew0011c0`,
+   `--start 2025-06-01 --end 2025-08-31 --workers 4`. Note the wall-clock
+   time from launch to instance self-termination.
+2. **3-way split** - the *same three months*, one per account, launched
+   at the same time: instance A does `matthew0011c0` /
+   `--start 2025-06-01 --end 2025-06-30`, instance B does `matthew0011c1` /
+   `--start 2025-07-01 --end 2025-07-31`, instance C does `matthew0011c2` /
+   `--start 2025-08-01 --end 2025-08-31`. Note the wall-clock time until
+   the *last* of the three terminates.
+3. Compare. If (2) finishes in roughly a third of (1)'s time, the
+   per-account cap was your bottleneck and the full 3-way split (table
+   above) is worth doing. If (2) isn't much faster than (1), Harmony's
+   shared backend is the limiter and more accounts won't help - fall back
+   to a single account for the full run.
+
+This costs about the same as one month's worth of downloading either way
+(same 3 months of data get pulled once, just arranged differently), so
+it's a cheap real answer instead of a guess.
 
 ## Alternative: AWS Batch
 
