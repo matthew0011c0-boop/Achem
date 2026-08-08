@@ -86,6 +86,25 @@
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
       "Resource": "arn:aws:ssm:us-west-2::parameter/aws/service/ami-amazon-linux-latest/*"
+    },
+    {
+      "Sid": "SsmManagedCorePolicyAttach",
+      "Effect": "Allow",
+      "Action": ["iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:ListAttachedRolePolicies"],
+      "Resource": "arn:aws:iam::977476317791:role/achem-tempo-role",
+      "Condition": {"ArnEquals": {"iam:PolicyARN": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"}}
+    },
+    {
+      "Sid": "SsmSessionToInstance",
+      "Effect": "Allow",
+      "Action": ["ssm:StartSession", "ssm:TerminateSession", "ssm:ResumeSession", "ssm:DescribeSessions", "ssm:GetConnectionStatus"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SsmDefaultVpcLookup",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeVpcs", "ec2:DescribeSubnets"],
+      "Resource": "*"
     }
   ]
 }

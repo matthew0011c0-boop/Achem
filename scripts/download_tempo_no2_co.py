@@ -279,6 +279,9 @@ def main() -> int:
         print("Bucket checks disabled (--no-bucket); resuming from local manifest only.")
 
     failures = 0
+    total = len(chunks)
+    completed = 0
+    run_start = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(
@@ -289,9 +292,21 @@ def main() -> int:
         }
         for future in as_completed(futures):
             result = future.result()
-            print(result)
+            completed += 1
             if "FAILED" in result or "INVALID" in result:
                 failures += 1
+
+            elapsed = time.monotonic() - run_start
+            remaining = total - completed
+            # Average pace over completed months, projected onto what's left. Only
+            # meaningful once at least one month has finished - before that there's
+            # nothing to extrapolate from, so ETA is left out rather than shown as 0:00.
+            eta = ""
+            if completed > 0 and remaining > 0:
+                avg_per_month = elapsed / completed
+                eta_seconds = avg_per_month * remaining
+                eta = f", ETA {dt.timedelta(seconds=round(eta_seconds))}"
+            print(f"[{completed}/{total} done, {remaining} left{eta}] {result}")
 
     print(f"\nDone. {len(chunks) - failures}/{len(chunks)} month(s) succeeded.")
     if failures:

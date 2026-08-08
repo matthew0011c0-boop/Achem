@@ -298,6 +298,43 @@ finished in 10 seconds because job 1's upload made jobs 2-9 immediately
 short-circuit. Fix is the one already used above - give every window
 (baseline included) its own distinct calendar month.
 
+## Alternative: persistent instance you can reconnect to
+
+The self-terminating instance in step 4 is meant to be started and left
+alone. If instead you want to launch from a browser-based shell (e.g. AWS
+CloudShell) and be able to close that tab and check back in later, use
+`scripts/launch_persistent_ec2.sh` instead:
+
+```bash
+./scripts/launch_persistent_ec2.sh
+```
+
+Differences from step 4: the instance does **not** self-terminate, and
+the container runs with `--restart unless-stopped` so it survives a
+reboot or crash. CloudShell itself doesn't stay up when you close the
+browser (AWS reclaims the underlying VM after ~20-30 min idle even with
+a background process running) - this launches the actual work onto a
+regular EC2 instance instead, which keeps running independently of
+CloudShell.
+
+Reconnect from anywhere with AWS credentials, no SSH key or open inbound
+port required (uses SSM Session Manager, granted via the
+`AmazonSSMManagedInstanceCore` policy the script attaches):
+
+```bash
+aws ssm start-session --target <instance-id> --region us-west-2
+# then, inside the session:
+sudo docker logs -f --tail 100 achem-tempo
+```
+
+`--start`/`--end`/`--workers`/`SECRET_ID` are overridable via env vars
+(`START`, `END`, `WORKERS`, `SECRET_ID`); see the script header. When the
+run is done (or you want to stop paying for it), terminate the instance:
+
+```bash
+aws ec2 terminate-instances --region us-west-2 --instance-ids <instance-id>
+```
+
 ## Alternative: AWS Batch
 
 For something more managed (automatic retry on failure, no manual instance
