@@ -64,3 +64,55 @@ python scripts/download_tempo_no2_co.py --short-name TEMPO_HCHO_L2 --start 2023-
   `done` / `failed`).
 - Downloaded data and the manifest are gitignored — this repo holds the
   pipeline code, not the satellite data itself.
+
+## Running in AWS (Batch on Fargate)
+
+This job is network/orchestration-bound, not CPU-bound: the actual spatial
+subsetting compute happens server-side on NASA's Harmony service, not on
+your container. Local work is just submitting requests, polling, and
+downloading files. **More vCPUs will not make this run faster** — a small
+container (2 vCPU / 4GB) is plenty; the only thing that meaningfully
+changes wall-clock time is `--workers` (concurrent Harmony jobs), and
+Harmony's own server-side throttling caps how far that helps.
+
+Setup (one-time):
+
+```bash
+# 1. Build and push the image to ECR
+aws ecr create-repository --repository-name tempo-no2-co-downloader
+docker build -t tempo-no2-co-downloader .
+aws ecr get-login-password | docker login --username AWS --password-stdin <account-id>.dkr.ecr.<region>.amazonaws.com
+docker tag tempo-no2-co-downloader:latest <account-id>.dkr.ecr.<region>.amazonaws.com/tempo-no2-co-downloader:latest
+docker push <account-id>.dkr.ecr.<region>.amazonaws.com/tempo-no2-co-downloader:latest
+
+# 2. Store Earthdata credentials in Secrets Manager
+aws secretsmanager create-secret --name tempo/earthdata \
+  --secret-string '{"username":"YOUR_USER","password":"YOUR_PASS"}'
+
+# 3. Create an S3 bucket to persist output/manifest across runs
+aws s3 mb s3://your-tempo-co-bucket
+
+# 4. IAM: create the Batch task role using deploy/iam-trust-policy.json
+#    (trust policy) and deploy/iam-task-role-policy.json (permissions -
+#    fill in the secret ARN and bucket name first). You also need the
+#    standard AWS-managed ecsTaskExecutionRole for the execution role.
+
+# 5. Register the job definition (fill in placeholders in
+#    deploy/aws-batch-job-definition.json first: image URI, role ARNs,
+#    bucket, secret ARN)
+aws batch register-job-definition --cli-input-json file://deploy/aws-batch-job-definition.json
+
+# 6. Create a Fargate compute environment + job queue (console or CLI),
+#    then submit a job, overriding date range/workers as needed:
+aws batch submit-job \
+  --job-name tempo-no2-co-2024 \
+  --job-queue your-fargate-job-queue \
+  --job-definition tempo-no2-co-downloader \
+  --container-overrides '{"environment":[{"name":"START_DATE","value":"2023-08-01"},{"name":"END_DATE","value":"2026-08-07"}]}'
+```
+
+The container entrypoint (`docker/entrypoint.sh`) fetches Earthdata
+credentials from Secrets Manager into `~/.netrc`, pulls any existing
+`data/tempo_no2_co/` + `manifest.json` from S3 to resume, syncs progress
+to S3 every 5 minutes while running (so a Spot interruption doesn't lose
+completed months), and does a final sync on exit.
