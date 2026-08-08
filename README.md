@@ -34,6 +34,10 @@ AWS credentials for the S3 bucket are picked up from the default AWS
 credential chain (env vars, `~/.aws/credentials`, an IAM role, etc.) - no
 secrets are stored in this repo.
 
+To run this unattended in AWS (self-terminating EC2, optionally split
+across multiple Earthdata accounts) instead of on your own machine, see
+[`docs/AWS_DEPLOY.md`](docs/AWS_DEPLOY.md).
+
 ## 2. Run
 
 ```bash
