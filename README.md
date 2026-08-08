@@ -51,8 +51,18 @@ python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07
   behavior: stop the script anytime, and whenever/wherever it's next run,
   already-downloaded months are recognized from the bucket, not just the
   local manifest.
-- Files land locally in `data/tempo_no2_co/<year>/<month>/`, then are
-  uploaded to the S3 bucket under the same `<year>/<month>/` layout.
+- Files land locally in `data/tempo_no2_co/<year>/<month>/` as the raw
+  Harmony-subsetted NetCDF granules.
+- **Each granule is then regridded onto a fixed 1km x 1km grid** (EPSG:5070,
+  Albers Equal-Area, so pixels are true 1km squares) covering the same
+  Colorado + DJ Basin bbox, and written as a sibling 4-band GeoTIFF
+  (`scripts/regrid_to_geotiff.py`):
+  1. `no2_troposphere` - NO2 tropospheric vertical column
+  2. `no2_stratosphere` - NO2 stratospheric vertical column
+  3. `qc_flag` - main data quality flag
+  4. `cloud_fraction` - effective cloud fraction
+- Both the raw `.nc` and the regridded `.tif` are uploaded to the S3 bucket
+  under the same `<year>/<month>/` layout.
 - Progress and per-month status are also checkpointed locally to
   `data/tempo_no2_co/manifest.json` as a fast local cache. If the script is
   interrupted or a month fails, just re-run the same command - completed
@@ -76,6 +86,10 @@ python scripts/download_tempo_no2_co.py --bucket my-other-bucket --bucket-prefix
 
 # Disable bucket checks entirely (local manifest only, original behavior)
 python scripts/download_tempo_no2_co.py --no-bucket
+
+# Backfill GeoTIFFs for granules already downloaded before this feature
+# existed, without re-downloading anything:
+python scripts/regrid_to_geotiff.py data/tempo_no2_co
 ```
 
 ## Notes / troubleshooting
@@ -95,5 +109,20 @@ python scripts/download_tempo_no2_co.py --no-bucket
   missing permissions, bucket doesn't exist), the script raises a clear
   error naming the bucket/prefix. Pass `--no-bucket` to fall back to
   local-only operation.
+- **Regridding variable mismatch**: `scripts/regrid_to_geotiff.py` expects
+  `product/vertical_column_troposphere`, `product/vertical_column_stratosphere`,
+  `product/main_data_quality_flag`, and `support_data/eff_cloud_fraction`
+  (plus `geolocation/latitude`/`longitude`) in each granule, with a fallback
+  to flattened variable names if Harmony strips NetCDF groups. If a
+  granule's actual layout differs, it raises a `KeyError` listing every
+  variable actually in the file - update the path constants at the top of
+  that script to match.
+- **Bucket-first check and new months only**: a month is skipped once
+  *any* object exists under its bucket prefix, so months uploaded to the
+  bucket before GeoTIFF regridding was added won't automatically get a
+  `.tif` on a later run. Backfill those with
+  `python scripts/regrid_to_geotiff.py data/tempo_no2_co` (see above) and
+  re-upload, or clear/version the bucket prefix if a full reprocess is
+  wanted.
 - Downloaded data and the manifest are gitignored - this repo holds the
   pipeline code, not the satellite data itself.

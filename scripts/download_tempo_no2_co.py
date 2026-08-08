@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Download TEMPO NO2 L2 data over Colorado, fast.
+"""Download TEMPO NO2 L2 data over Colorado + the DJ Basin, fast.
 
 Strategy: instead of pulling full continent-wide L2 granules (multi-TB for
 the full mission), we ask NASA's Harmony service to spatially subset each
-granule to a Colorado bounding box *before* it leaves NASA's servers. That
+granule to a regional bounding box *before* it leaves NASA's servers. That
 cuts per-file size by ~95%+, which is what makes "download the whole TEMPO
-NO2 archive for Colorado in a few hours" realistic.
+NO2 archive for this region in a few hours" realistic.
 
 The date range is split into one Harmony job per calendar month and jobs
 are processed concurrently (submit + wait + download), so we're not
-waiting on one giant serial job. Progress is checkpointed to a manifest
-file so the script can be killed and re-run without redoing finished
-months.
+waiting on one giant serial job. Each downloaded granule is then regridded
+onto a fixed 1km x 1km GeoTIFF (NO2 troposphere/stratosphere, QC flag,
+cloud fraction - see regrid_to_geotiff.py) and both files are uploaded to
+S3. Before doing any of this for a given month, the S3 bucket is checked
+first - if that month is already there, the whole month is skipped. That
+bucket check (not just the local manifest) is what makes the pipeline safe
+to stop and restart from any machine.
 
 Usage:
     python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07
@@ -38,6 +42,7 @@ import boto3
 import earthaccess
 from harmony import BBox, Client, Collection, Environment, Request
 
+from regrid_to_geotiff import regrid_file
 from tempo_common import (
     CO_BBOX,
     DEFAULT_BUCKET,
@@ -135,18 +140,25 @@ def process_chunk(
             for future in client.download_all(job_id, directory=str(dest), overwrite=False):
                 files.append(str(future.result()))
 
+            tif_files = []
+            for nc_file in files:
+                if Path(nc_file).suffix.lower() in (".nc", ".nc4"):
+                    tif_files.append(str(regrid_file(Path(nc_file))))
+
             entry["status"] = "done"
             entry["files"] = files
+            entry["tif_files"] = tif_files
             entry.pop("error", None)
 
             upload_note = ""
             if s3_client is not None and bucket:
-                s3_keys = upload_month_to_bucket(s3_client, bucket, bucket_prefix, chunk_start, files)
+                s3_keys = upload_month_to_bucket(s3_client, bucket, bucket_prefix, chunk_start, files + tif_files)
                 entry["s3_keys"] = s3_keys
                 upload_note = f", uploaded to s3://{bucket}/"
 
             save_manifest(manifest_path, manifest)
-            return f"{key}: downloaded {len(files)} file(s) -> {dest}{upload_note}"
+            return (f"{key}: downloaded {len(files)} file(s), regridded {len(tif_files)} to 1km GeoTIFF "
+                    f"-> {dest}{upload_note}")
         except Exception as exc:  # noqa: BLE001 - retry loop, want to catch broadly
             last_err = exc
             entry["status"] = "retrying"
