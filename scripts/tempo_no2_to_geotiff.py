@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from pathlib import Path
 from typing import NamedTuple
 
@@ -39,6 +40,14 @@ from pyresample.kd_tree import resample_nearest
 from rasterio.transform import from_bounds
 
 from tempo_common import CO_BBOX
+
+# The HDF5 C library underlying netCDF4 is not thread-safe by default (most
+# distributed builds, including the pip wheels used here, aren't compiled
+# with its thread-safe option). Reading two granules concurrently from
+# different threads corrupts HDF5's internal state and segfaults the whole
+# process - this lock serializes only the actual file reads; the CPU-bound
+# resampling below runs unsynchronized.
+HDF5_LOCK = threading.Lock()
 
 # Nominal TEMPO ground pixel is ~2.1 x 4.4 km at best; use a grid finer than
 # that and a matching search radius so nearest-neighbor resampling doesn't
@@ -134,7 +143,7 @@ def convert_granule(
     Returns "written", "empty" (no valid pixels over the bbox - nothing was
     written), or raises on unexpected failure.
     """
-    with netCDF4.Dataset(nc_path, "r") as ds:
+    with HDF5_LOCK, netCDF4.Dataset(nc_path, "r") as ds:
         lat = read_masked(find_variable(ds, LAT_PATH))
         lon = read_masked(find_variable(ds, LON_PATH))
 
@@ -144,27 +153,7 @@ def convert_granule(
         if not np.any(valid):
             return "empty"
 
-        swath_def = SwathDefinition(lons=np.where(valid, lon, np.nan), lats=np.where(valid, lat, np.nan))
-
-        width = max(1, round((east - west) / resolution_deg))
-        height = max(1, round((north - south) / resolution_deg))
-        area_def = AreaDefinition(
-            "co_grid", "Colorado lat/lon grid", "latlon",
-            {"proj": "longlat", "datum": "WGS84"},
-            width, height,
-            (west, south, east, north),
-        )
-
-        bands = []
-        for spec in BAND_SPECS:
-            var = find_variable(ds, spec.path)
-            data = read_masked(var)
-            resampled = resample_nearest(
-                swath_def, data, area_def,
-                radius_of_influence=radius_of_influence_m,
-                fill_value=np.nan,
-            )
-            bands.append(resampled.astype("float32"))
+        raw_bands = [read_masked(find_variable(ds, spec.path)) for spec in BAND_SPECS]
 
         granule_attrs = {
             "source_file": nc_path.name,
@@ -174,6 +163,28 @@ def convert_granule(
             "radius_of_influence_m": str(radius_of_influence_m),
             "grid_resolution_deg": str(resolution_deg),
         }
+
+    # Everything below is pure numpy/pyresample - no HDF5 involved - so it's
+    # safe to run unsynchronized across threads.
+    swath_def = SwathDefinition(lons=np.where(valid, lon, np.nan), lats=np.where(valid, lat, np.nan))
+
+    width = max(1, round((east - west) / resolution_deg))
+    height = max(1, round((north - south) / resolution_deg))
+    area_def = AreaDefinition(
+        "co_grid", "Colorado lat/lon grid", "latlon",
+        {"proj": "longlat", "datum": "WGS84"},
+        width, height,
+        (west, south, east, north),
+    )
+
+    bands = []
+    for data in raw_bands:
+        resampled = resample_nearest(
+            swath_def, data, area_def,
+            radius_of_influence=radius_of_influence_m,
+            fill_value=np.nan,
+        )
+        bands.append(resampled.astype("float32"))
 
     if not any(np.any(np.isfinite(b)) for b in bands):
         return "empty"

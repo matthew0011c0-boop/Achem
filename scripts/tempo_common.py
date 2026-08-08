@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 
 import earthaccess
+
+log = logging.getLogger("tempo_no2")
 
 # Colorado bounding box (west, south, east, north), in degrees.
 # Slightly padded beyond the state border so edge pixels aren't clipped.
@@ -37,7 +40,7 @@ def resolve_concept_id(short_name: str = DEFAULT_SHORT_NAME, version: str = DEFA
             f"Available versions: {available}"
         )
     concept_id = matches[0]["meta"]["concept-id"]
-    print(f"Resolved {short_name} {version} -> {concept_id}")
+    log.info("Resolved %s %s -> %s", short_name, version, concept_id)
     return concept_id
 
 
