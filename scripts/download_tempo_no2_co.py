@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download TEMPO NO2 L2 data over Colorado, fast.
+"""Download TEMPO NO2 L2 data over Colorado, convert to GeoTIFF, done.
 
 Strategy: instead of pulling full continent-wide L2 granules (multi-TB for
 the full mission), we ask NASA's Harmony service to spatially subset each
@@ -13,6 +13,12 @@ waiting on one giant serial job. Progress is checkpointed to a manifest
 file so the script can be killed and re-run without redoing finished
 months.
 
+Each downloaded granule (.nc) is immediately resampled onto a uniform
+Colorado grid and written out as a multi-band GeoTIFF (NO2 tropospheric/
+stratospheric/total columns + quality flags - see tempo_no2_to_geotiff.py),
+then the source .nc is deleted. This keeps disk usage bounded by one
+month's worth of granules at a time instead of the whole archive.
+
 Usage:
     python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07
 
@@ -21,6 +27,9 @@ Usage:
 
     # Tune concurrency (default 4 concurrent Harmony jobs):
     python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07 --workers 6
+
+    # Keep the raw .nc files around instead of deleting them post-conversion:
+    python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07 --keep-nc
 """
 from __future__ import annotations
 
@@ -37,7 +46,8 @@ from pathlib import Path
 import earthaccess
 from harmony import BBox, Client, Collection, Environment, Request
 
-from tempo_common import CO_BBOX, DEFAULT_SHORT_NAME, MISSION_DATA_START, month_chunks, resolve_concept_id
+from tempo_common import CO_BBOX, DEFAULT_SHORT_NAME, DEFAULT_VERSION, MISSION_DATA_START, month_chunks, resolve_concept_id
+from tempo_no2_to_geotiff import DEFAULT_RADIUS_OF_INFLUENCE_M, DEFAULT_RESOLUTION_DEG, convert_granule
 
 MANIFEST_LOCK = threading.Lock()
 
@@ -60,6 +70,31 @@ def save_manifest(path: Path, manifest: dict) -> None:
             raise
 
 
+def convert_and_cleanup(files: list[str], keep_nc: bool, resolution_deg: float, radius_of_influence_m: float) -> tuple[list[str], int, int]:
+    """Convert each downloaded .nc to GeoTIFF and (unless --keep-nc) delete the .nc.
+
+    Returns (tif_paths, n_empty, n_failed).
+    """
+    tif_paths = []
+    n_empty = n_failed = 0
+    for nc_file in files:
+        nc_path = Path(nc_file)
+        tif_path = nc_path.with_suffix(".tif")
+        try:
+            result = convert_granule(nc_path, tif_path, resolution_deg=resolution_deg,
+                                      radius_of_influence_m=radius_of_influence_m)
+            if result == "written":
+                tif_paths.append(str(tif_path))
+            else:
+                n_empty += 1
+            if not keep_nc:
+                nc_path.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001 - keep going on per-file failures
+            n_failed += 1
+            print(f"  {nc_path.name}: GeoTIFF conversion FAILED - {exc} (keeping .nc)", file=sys.stderr)
+    return tif_paths, n_empty, n_failed
+
+
 def process_chunk(
     client: Client,
     collection: Collection,
@@ -69,12 +104,15 @@ def process_chunk(
     manifest_path: Path,
     manifest: dict,
     max_retries: int = 3,
+    keep_nc: bool = False,
+    resolution_deg: float = DEFAULT_RESOLUTION_DEG,
+    radius_of_influence_m: float = DEFAULT_RADIUS_OF_INFLUENCE_M,
 ) -> str:
     key = chunk_start.isoformat()
     entry = manifest.setdefault(key, {"status": "pending"})
 
     if entry.get("status") == "done":
-        return f"{key}: already done ({len(entry.get('files', []))} files), skipping"
+        return f"{key}: already done ({len(entry.get('tif_files', entry.get('files', [])))} GeoTIFF(s)), skipping"
 
     dest = out_dir / f"{chunk_start.year:04d}" / f"{chunk_start.month:02d}"
     dest.mkdir(parents=True, exist_ok=True)
@@ -108,11 +146,20 @@ def process_chunk(
             for future in client.download_all(job_id, directory=str(dest), overwrite=False):
                 files.append(str(future.result()))
 
+            tif_files, n_empty, n_failed = convert_and_cleanup(files, keep_nc, resolution_deg, radius_of_influence_m)
+
             entry["status"] = "done"
-            entry["files"] = files
+            entry["tif_files"] = tif_files
+            entry["n_empty"] = n_empty
+            entry["n_conversion_failed"] = n_failed
             entry.pop("error", None)
             save_manifest(manifest_path, manifest)
-            return f"{key}: downloaded {len(files)} file(s) -> {dest}"
+            summary = f"{len(tif_files)} GeoTIFF(s)"
+            if n_empty:
+                summary += f", {n_empty} empty"
+            if n_failed:
+                summary += f", {n_failed} conversion FAILED"
+            return f"{key}: downloaded {len(files)} granule(s) -> {summary} in {dest}"
         except Exception as exc:  # noqa: BLE001 - retry loop, want to catch broadly
             last_err = exc
             entry["status"] = "retrying"
@@ -135,10 +182,17 @@ def main() -> int:
     parser.add_argument("--end", type=dt.date.fromisoformat, default=dt.date.today(),
                          help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--short-name", default=DEFAULT_SHORT_NAME, help="CMR short_name of the TEMPO product")
+    parser.add_argument("--version", default=DEFAULT_VERSION, help=f"CMR product version (default: {DEFAULT_VERSION})")
     parser.add_argument("--out-dir", type=Path, default=Path("data/tempo_no2_co"), help="Output directory")
     parser.add_argument("--manifest", type=Path, default=None,
                          help="Manifest path (default: <out-dir>/manifest.json)")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent Harmony jobs (default: 4)")
+    parser.add_argument("--keep-nc", action="store_true",
+                         help="Keep source .nc files after GeoTIFF conversion (default: delete them)")
+    parser.add_argument("--resolution-deg", type=float, default=DEFAULT_RESOLUTION_DEG,
+                         help=f"GeoTIFF grid resolution in degrees (default: {DEFAULT_RESOLUTION_DEG})")
+    parser.add_argument("--radius-of-influence-m", type=float, default=DEFAULT_RADIUS_OF_INFLUENCE_M,
+                         help=f"GeoTIFF resampling search radius in meters (default: {DEFAULT_RADIUS_OF_INFLUENCE_M})")
     args = parser.parse_args()
 
     if args.end < args.start:
@@ -149,12 +203,17 @@ def main() -> int:
     manifest_path = args.manifest or (out_dir / "manifest.json")
 
     print("Checking Earthdata authentication...")
-    auth = earthaccess.login(strategy="netrc")
+    # "all" tries, in order: EARTHDATA_USERNAME/EARTHDATA_PASSWORD env vars,
+    # then ~/.netrc, then an interactive prompt - so this works both in
+    # non-interactive environments (env vars set) and on a local machine
+    # that's already run setup_earthdata_auth.py.
+    auth = earthaccess.login(strategy="all", persist=True)
     if not auth.authenticated:
-        print("Not authenticated. Run scripts/setup_earthdata_auth.py first.", file=sys.stderr)
+        print("Not authenticated. Run scripts/setup_earthdata_auth.py, or set "
+              "EARTHDATA_USERNAME/EARTHDATA_PASSWORD env vars, first.", file=sys.stderr)
         return 1
 
-    concept_id = resolve_concept_id(args.short_name)
+    concept_id = resolve_concept_id(args.short_name, args.version)
     collection = Collection(id=concept_id)
     client = Client(env=Environment.PROD)
 
@@ -169,7 +228,9 @@ def main() -> int:
     failures = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(process_chunk, client, collection, cs, ce, out_dir, manifest_path, manifest): cs
+            pool.submit(process_chunk, client, collection, cs, ce, out_dir, manifest_path, manifest,
+                        keep_nc=args.keep_nc, resolution_deg=args.resolution_deg,
+                        radius_of_influence_m=args.radius_of_influence_m): cs
             for cs, ce in chunks
         }
         for future in as_completed(futures):
