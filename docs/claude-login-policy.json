@@ -1,0 +1,110 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3BucketData",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::matt-achem-bucket2",
+      "Condition": {"StringLike": {"s3:prefix": "tempo_no2_co/*"}}
+    },
+    {
+      "Sid": "S3ObjectData",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::matt-achem-bucket2/tempo_no2_co/*"
+    },
+    {
+      "Sid": "IamRoleForEc2",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole", "iam:GetRole", "iam:DeleteRole",
+        "iam:PutRolePolicy", "iam:GetRolePolicy", "iam:DeleteRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::977476317791:role/achem-tempo-role"
+    },
+    {
+      "Sid": "IamInstanceProfile",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateInstanceProfile", "iam:GetInstanceProfile", "iam:DeleteInstanceProfile",
+        "iam:AddRoleToInstanceProfile", "iam:RemoveRoleFromInstanceProfile"
+      ],
+      "Resource": "arn:aws:iam::977476317791:instance-profile/achem-tempo-profile"
+    },
+    {
+      "Sid": "IamPassRoleToEc2",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::977476317791:role/achem-tempo-role",
+      "Condition": {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}}
+    },
+    {
+      "Sid": "Ec2InstanceLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances", "ec2:TerminateInstances", "ec2:CreateTags",
+        "ec2:DescribeInstances", "ec2:DescribeImages", "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets", "ec2:DescribeVpcs", "ec2:DescribeInstanceStatus"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrRepo",
+      "Effect": "Allow",
+      "Action": ["ecr:CreateRepository", "ecr:DescribeRepositories"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrPushPull",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrRepoScoped",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage",
+        "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"
+      ],
+      "Resource": "arn:aws:ecr:us-west-2:977476317791:repository/achem-tempo"
+    },
+    {
+      "Sid": "SecretsForEarthdata",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret", "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-west-2:977476317791:secret:achem/earthdata/*"
+    },
+    {
+      "Sid": "SsmAmiLookup",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:us-west-2::parameter/aws/service/ami-amazon-linux-latest/*"
+    },
+    {
+      "Sid": "SsmManagedCorePolicyAttach",
+      "Effect": "Allow",
+      "Action": ["iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:ListAttachedRolePolicies"],
+      "Resource": "arn:aws:iam::977476317791:role/achem-tempo-role",
+      "Condition": {"ArnEquals": {"iam:PolicyARN": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"}}
+    },
+    {
+      "Sid": "SsmSessionToInstance",
+      "Effect": "Allow",
+      "Action": ["ssm:StartSession", "ssm:TerminateSession", "ssm:ResumeSession", "ssm:DescribeSessions", "ssm:GetConnectionStatus"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SsmDefaultVpcLookup",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeVpcs", "ec2:DescribeSubnets"],
+      "Resource": "*"
+    }
+  ]
+}

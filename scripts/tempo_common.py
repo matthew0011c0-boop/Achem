@@ -3,17 +3,31 @@ from __future__ import annotations
 
 import datetime as dt
 
+import boto3
 import earthaccess
+from botocore.exceptions import ClientError, NoCredentialsError
 
-# Colorado bounding box (west, south, east, north), in degrees.
-# Slightly padded beyond the state border so edge pixels aren't clipped.
-CO_BBOX = (-109.15, 36.95, -101.95, 41.05)
+# Colorado + Denver-Julesburg (DJ/Julesburg) Basin bounding box
+# (west, south, east, north), in degrees.
+#
+# Colorado's own border is roughly (-109.05, 37.0, -102.05, 41.0); the DJ
+# Basin extends beyond it to the north (into SE Wyoming) and east (into W
+# Nebraska / NW Kansas), so the box is widened on those two edges. South and
+# west stay at Colorado's border since the basin doesn't extend past it
+# there. All edges carry a small pad so edge pixels aren't clipped.
+CO_BBOX = (-109.15, 36.95, -100.5, 43.05)
 
 # TEMPO L2 NO2 tropospheric column product.
 DEFAULT_SHORT_NAME = "TEMPO_NO2_L2"
 
 # Public data availability start (TEMPO L2 NO2 V03 science data).
 MISSION_DATA_START = dt.date(2023, 8, 1)
+
+# Default S3 bucket used as the source of truth for what's already been
+# downloaded. Lets the download script be stopped/restarted (or moved to a
+# fresh machine with an empty local disk) without redoing finished months.
+DEFAULT_BUCKET = "matt-achem-bucket2"
+DEFAULT_BUCKET_PREFIX = "tempo_no2_co"
 
 
 def resolve_concept_id(short_name: str = DEFAULT_SHORT_NAME) -> str:
@@ -45,3 +59,68 @@ def month_chunks(start: dt.date, end: dt.date):
         chunk_end = min(nxt - dt.timedelta(days=1), end)
         yield chunk_start, chunk_end
         cur = nxt
+
+
+def split_range_by_month(start: dt.date, end: dt.date, n: int) -> list[tuple[dt.date, dt.date]]:
+    """Split [start, end] into up to n contiguous, calendar-month-aligned sub-ranges.
+
+    Used to divide work across multiple Earthdata accounts running
+    concurrently. Splitting on month boundaries (not raw days) matters
+    because the bucket-first resume check operates at month granularity -
+    two accounts whose ranges overlapped mid-month could race to claim
+    the same month (see the AWS_DEPLOY.md gotcha about same-month test
+    windows). Returns fewer than n ranges if there are fewer than n months
+    in [start, end].
+    """
+    months = list(month_chunks(start, end))
+    if not months:
+        return []
+    n = min(n, len(months))
+    base, extra = divmod(len(months), n)
+    ranges = []
+    idx = 0
+    for i in range(n):
+        count = base + (1 if i < extra else 0)
+        group = months[idx : idx + count]
+        idx += count
+        ranges.append((group[0][0], group[-1][1]))
+    return ranges
+
+
+def month_prefix(bucket_prefix: str, chunk_start: dt.date) -> str:
+    """S3 key prefix a given month's files are stored under."""
+    return f"{bucket_prefix.rstrip('/')}/{chunk_start.year:04d}/{chunk_start.month:02d}/"
+
+
+def bucket_has_month(s3_client, bucket: str, bucket_prefix: str, chunk_start: dt.date) -> list[str]:
+    """Return the S3 keys already stored for this month, or [] if none.
+
+    This is the "check the bucket first" step: it lets a stopped/restarted
+    run (even on a fresh machine with no local disk state) recognize work
+    that's already done without re-hitting Harmony.
+    """
+    prefix = month_prefix(bucket_prefix, chunk_start)
+    try:
+        resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+    except (ClientError, NoCredentialsError) as exc:
+        raise RuntimeError(
+            f"Could not list s3://{bucket}/{prefix} - check AWS credentials/permissions "
+            f"(or pass --no-bucket to disable bucket checks): {exc}"
+        ) from exc
+    return [obj["Key"] for obj in resp.get("Contents", [])]
+
+
+def upload_month_to_bucket(
+    s3_client, bucket: str, bucket_prefix: str, chunk_start: dt.date, local_files: list[str]
+) -> list[str]:
+    """Upload downloaded files for a month to S3 so the bucket becomes the durable record."""
+    prefix = month_prefix(bucket_prefix, chunk_start)
+    keys = []
+    for local_path in local_files:
+        key = prefix + local_path.rsplit("/", 1)[-1]
+        try:
+            s3_client.upload_file(local_path, bucket, key)
+        except (ClientError, NoCredentialsError) as exc:
+            raise RuntimeError(f"Failed to upload {local_path} to s3://{bucket}/{key}: {exc}") from exc
+        keys.append(key)
+    return keys
