@@ -137,6 +137,12 @@ aws iam create-role --role-name achem-tempo-role \
 aws iam put-role-policy --role-name achem-tempo-role \
   --policy-name achem-tempo-policy --policy-document file://achem-tempo-policy.json
 
+# Lets you open a live shell on the instance later (Session Manager) - see
+# "Live terminal access" below. Not needed for the download to run, only for
+# watching it interactively.
+aws iam attach-role-policy --role-name achem-tempo-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
 aws iam create-instance-profile --instance-profile-name achem-tempo-profile
 aws iam add-role-to-instance-profile \
   --instance-profile-name achem-tempo-profile --role-name achem-tempo-role
@@ -209,6 +215,45 @@ the instance (via SSM Session Manager, or a mounted EBS volume you inspect
 after termination) has the full per-month output. If a run dies partway
 through, just launch it again with the same `--start`/`--end` - the bucket
 check picks up exactly where it left off.
+
+### Live terminal access (SSM Session Manager)
+
+To watch the run interactively instead of polling S3 or reading the log
+after the fact, open a shell directly on the instance with AWS Systems
+Manager - no SSH key pair, no open inbound port, no security group change
+needed (Session Manager connects out over the same outbound 443 the
+instance already has). This requires the `AmazonSSMManagedInstanceCore`
+policy attached to `achem-tempo-role` (step 3 above) and the SSM Agent,
+which ships preinstalled on the Amazon Linux 2023 AMI used here.
+
+```bash
+aws ssm start-session --region us-west-2 --target <INSTANCE_ID>
+```
+
+`<INSTANCE_ID>` is printed by the `run-instances` call in step 4
+(`Instances[0].InstanceId`), or look it up with:
+
+```bash
+aws ec2 describe-instances --region us-west-2 \
+  --filters Name=tag:Name,Values=achem-tempo-a Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].InstanceId' --output text
+```
+
+Once connected (you land as `ssm-user`, root via `sudo`), watch progress
+live with either:
+
+```bash
+sudo tail -f /var/log/achem-download.log      # everything user-data has run/logged
+
+docker ps                                     # find the running container
+sudo docker logs -f <CONTAINER_ID>             # just the downloader's own output
+```
+
+The session closes on its own if the instance terminates (end of run), and
+you can open more than one `start-session` at a time (e.g. one tailing
+logs, another free for `docker ps`/`aws s3 ls` checks) without affecting
+the running job - Session Manager is read/observe only unless you
+deliberately run something destructive.
 
 ## Splitting across multiple Earthdata accounts
 
