@@ -30,6 +30,19 @@ prompted again.
 If you don't have an Earthdata account yet, create one first at
 https://urs.earthdata.nasa.gov/users/new
 
+**Switching between multiple Earthdata accounts** (e.g. for the
+multi-account split in `docs/AWS_DEPLOY.md`): copy
+`secrets/earthdata_accounts.json.example` to `secrets/earthdata_accounts.json`
+and fill in real usernames/passwords - that file is gitignored, so real
+credentials never get committed. Then:
+
+```bash
+python scripts/use_earthdata_account.py matthew0011c1
+```
+
+writes `~/.netrc` for that account, same as `setup_earthdata_auth.py`
+would, just without the interactive prompt.
+
 AWS credentials for the S3 bucket are picked up from the default AWS
 credential chain (env vars, `~/.aws/credentials`, an IAM role, etc.) - no
 secrets are stored in this repo.
