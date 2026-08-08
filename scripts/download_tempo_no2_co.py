@@ -57,6 +57,38 @@ from tempo_common import (
 
 MANIFEST_LOCK = threading.Lock()
 
+# Harmony auto-pauses jobs above a certain size as a safety check. The
+# harmony-py client's own wait_for_processing() treats "paused" as a stop
+# condition - it just prints a message and returns, leaving whatever
+# fraction of the job ran before the pause as if it were the final result.
+# For a month-sized request that silently truncates a month's worth of
+# granules down to whatever trickled through before the pause. Poll and
+# resume ourselves instead so we actually wait for real completion.
+MAX_RESUMES = 20
+
+
+def wait_for_processing_resuming(client: Client, job_id: str) -> None:
+    resumes = 0
+    progress = 0
+    while progress < 100:
+        progress, status, message = client.progress(job_id)
+        if status == "failed":
+            raise RuntimeError(f"Harmony job {job_id} failed: {message}")
+        if status == "canceled":
+            raise RuntimeError(f"Harmony job {job_id} was canceled: {message}")
+        if status in ("successful", "complete_with_errors"):
+            return
+        if status == "paused":
+            resumes += 1
+            if resumes > MAX_RESUMES:
+                raise RuntimeError(
+                    f"Harmony job {job_id} paused {resumes} times without completing - "
+                    f"giving up rather than looping forever."
+                )
+            client.resume(job_id)
+            continue
+        time.sleep(client.check_interval)
+
 
 def load_manifest(path: Path) -> dict:
     if path.exists():
@@ -134,11 +166,31 @@ def process_chunk(
             entry["job_id"] = job_id
             save_manifest(manifest_path, manifest)
 
-            client.wait_for_processing(job_id, show_progress=False)
+            wait_for_processing_resuming(client, job_id)
 
             files = []
             for future in client.download_all(job_id, directory=str(dest), overwrite=False):
                 files.append(str(future.result()))
+
+            # Defense in depth against a repeat of the Harmony-pause bug (or any other
+            # failure mode that returns a partial result without erroring): cross-check
+            # the download count against CMR's own count for the identical collection +
+            # bbox + date window before ever calling this month "done". A silent partial
+            # month would otherwise look complete forever, since the bucket-first check
+            # only asks "does anything exist here", not "is everything here".
+            expected = (
+                earthaccess.DataGranules()
+                .concept_id(collection.id)
+                .bounding_box(*CO_BBOX)
+                .temporal(chunk_start.isoformat(), chunk_end.isoformat())
+                .hits()
+            )
+            if expected > 0 and len(files) < expected * 0.95:
+                raise RuntimeError(
+                    f"Got {len(files)} file(s) but CMR reports {expected} granule(s) exist "
+                    f"for this window - Harmony likely returned a partial result (e.g. an "
+                    f"auto-paused job). Not marking this month done."
+                )
 
             tif_files = []
             for nc_file in files:
