@@ -15,9 +15,14 @@ months.
 
 Each downloaded granule (.nc) is immediately resampled onto a uniform
 Colorado grid and written out as a multi-band GeoTIFF (NO2 tropospheric/
-stratospheric/total columns + quality flags - see tempo_no2_to_geotiff.py),
-then the source .nc is deleted. This keeps disk usage bounded by one
-month's worth of granules at a time instead of the whole archive.
+stratospheric/total columns + quality flags - see tempo_no2_to_geotiff.py).
+
+By default the source .nc is then deleted, keeping local disk usage
+bounded to one month's worth of granules at a time instead of the whole
+archive. Pass --s3-bucket to instead upload both the .nc and .tif to S3
+after conversion and delete the local copies once the upload succeeds -
+this keeps disk usage bounded the same way while actually retaining every
+file (durably, in S3) rather than throwing the .nc away.
 
 Usage:
     python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07
@@ -28,8 +33,12 @@ Usage:
     # Tune concurrency (default 4 concurrent Harmony jobs):
     python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07 --workers 6
 
-    # Keep the raw .nc files around instead of deleting them post-conversion:
+    # Keep the raw .nc files on local disk instead of deleting them post-conversion:
     python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07 --keep-nc
+
+    # Upload every finished .nc/.tif to S3 instead of keeping them locally:
+    python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07 \\
+        --s3-bucket my-tempo-bucket --s3-prefix tempo_no2_co
 """
 from __future__ import annotations
 
@@ -44,6 +53,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import boto3
 import earthaccess
 from harmony import BBox, Client, Collection, Environment, Request
 
@@ -71,12 +81,30 @@ def save_manifest(path: Path, manifest: dict) -> None:
             raise
 
 
-def convert_and_cleanup(files: list[str], keep_nc: bool, resolution_deg: float, radius_of_influence_m: float) -> tuple[list[str], int, int]:
-    """Convert each downloaded .nc to GeoTIFF and (unless --keep-nc) delete the .nc.
+def upload_to_s3(s3_client, local_path: Path, bucket: str, key: str) -> str:
+    """Upload local_path to s3://bucket/key and return that URI."""
+    s3_client.upload_file(str(local_path), bucket, key)
+    return f"s3://{bucket}/{key}"
 
-    Returns (tif_paths, n_empty, n_failed).
+
+def convert_and_cleanup(
+    files: list[str],
+    keep_nc: bool,
+    resolution_deg: float,
+    radius_of_influence_m: float,
+    s3_client=None,
+    s3_bucket: str | None = None,
+    s3_prefix: str = "",
+) -> tuple[list[str], list[str], int, int]:
+    """Convert each downloaded .nc to GeoTIFF, then either upload both to S3
+    (deleting the local copies once each upload succeeds) or, without S3,
+    keep the .tif locally and delete the .nc unless --keep-nc.
+
+    Returns (tif_locations, nc_locations, n_empty, n_failed). Locations are
+    s3:// URIs when s3_bucket is set, otherwise local filesystem paths.
     """
-    tif_paths = []
+    tif_locations = []
+    nc_locations = []
     n_empty = n_failed = 0
     for nc_file in files:
         nc_path = Path(nc_file)
@@ -84,16 +112,29 @@ def convert_and_cleanup(files: list[str], keep_nc: bool, resolution_deg: float, 
         try:
             result = convert_granule(nc_path, tif_path, resolution_deg=resolution_deg,
                                       radius_of_influence_m=radius_of_influence_m)
-            if result == "written":
-                tif_paths.append(str(tif_path))
-            else:
+            wrote_tif = result == "written"
+            if not wrote_tif:
                 n_empty += 1
-            if not keep_nc:
+
+            if s3_bucket:
+                nc_key = f"{s3_prefix}/{nc_path.name}"
+                nc_locations.append(upload_to_s3(s3_client, nc_path, s3_bucket, nc_key))
                 nc_path.unlink(missing_ok=True)
+                if wrote_tif:
+                    tif_key = f"{s3_prefix}/{tif_path.name}"
+                    tif_locations.append(upload_to_s3(s3_client, tif_path, s3_bucket, tif_key))
+                    tif_path.unlink(missing_ok=True)
+            else:
+                if wrote_tif:
+                    tif_locations.append(str(tif_path))
+                if keep_nc:
+                    nc_locations.append(str(nc_path))
+                else:
+                    nc_path.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001 - keep going on per-file failures
             n_failed += 1
-            print(f"  {nc_path.name}: GeoTIFF conversion FAILED - {exc} (keeping .nc)", file=sys.stderr)
-    return tif_paths, n_empty, n_failed
+            print(f"  {nc_path.name}: conversion/upload FAILED - {exc} (keeping local file(s))", file=sys.stderr)
+    return tif_locations, nc_locations, n_empty, n_failed
 
 
 def process_chunk(
@@ -108,6 +149,9 @@ def process_chunk(
     keep_nc: bool = False,
     resolution_deg: float = DEFAULT_RESOLUTION_DEG,
     radius_of_influence_m: float = DEFAULT_RADIUS_OF_INFLUENCE_M,
+    s3_client=None,
+    s3_bucket: str | None = None,
+    s3_prefix: str = "",
 ) -> str:
     key = chunk_start.isoformat()
     entry = manifest.setdefault(key, {"status": "pending"})
@@ -147,10 +191,15 @@ def process_chunk(
             for future in client.download_all(job_id, directory=str(dest), overwrite=False):
                 files.append(str(future.result()))
 
-            tif_files, n_empty, n_failed = convert_and_cleanup(files, keep_nc, resolution_deg, radius_of_influence_m)
+            chunk_s3_prefix = f"{s3_prefix}/{chunk_start.year:04d}/{chunk_start.month:02d}"
+            tif_files, nc_files, n_empty, n_failed = convert_and_cleanup(
+                files, keep_nc, resolution_deg, radius_of_influence_m,
+                s3_client=s3_client, s3_bucket=s3_bucket, s3_prefix=chunk_s3_prefix,
+            )
 
             entry["status"] = "done"
             entry["tif_files"] = tif_files
+            entry["nc_files"] = nc_files
             entry["n_empty"] = n_empty
             entry["n_conversion_failed"] = n_failed
             entry.pop("error", None)
@@ -194,6 +243,13 @@ def main() -> int:
                          help=f"GeoTIFF grid resolution in degrees (default: {DEFAULT_RESOLUTION_DEG})")
     parser.add_argument("--radius-of-influence-m", type=float, default=DEFAULT_RADIUS_OF_INFLUENCE_M,
                          help=f"GeoTIFF resampling search radius in meters (default: {DEFAULT_RADIUS_OF_INFLUENCE_M})")
+    parser.add_argument("--s3-bucket", default=os.environ.get("TEMPO_S3_BUCKET"),
+                         help="If set, upload every finished .nc and .tif to this S3 bucket and delete the "
+                              "local copies once each upload succeeds, instead of keeping files on local disk "
+                              "(env: TEMPO_S3_BUCKET). Uses boto3's default credential chain "
+                              "(AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN, or an instance/task role).")
+    parser.add_argument("--s3-prefix", default=os.environ.get("TEMPO_S3_PREFIX", "tempo_no2_co"),
+                         help="S3 key prefix for uploaded files (default: tempo_no2_co, env: TEMPO_S3_PREFIX)")
     args = parser.parse_args()
 
     if args.end < args.start:
@@ -227,12 +283,17 @@ def main() -> int:
     collection = Collection(id=concept_id)
     client = Client(env=Environment.PROD)
 
+    s3_client = boto3.client("s3") if args.s3_bucket else None
+
     manifest = load_manifest(manifest_path)
     chunks = list(month_chunks(args.start, args.end))
     print(f"Processing {len(chunks)} month(s) from {args.start} to {args.end} "
           f"with {args.workers} concurrent Harmony job(s).")
     print(f"Colorado bbox: {CO_BBOX}")
-    print(f"Output dir: {out_dir}")
+    if args.s3_bucket:
+        print(f"Output: s3://{args.s3_bucket}/{args.s3_prefix}/ (local disk used only as scratch space)")
+    else:
+        print(f"Output dir: {out_dir}")
     print(f"Manifest: {manifest_path}")
 
     failures = 0
@@ -240,7 +301,8 @@ def main() -> int:
         futures = {
             pool.submit(process_chunk, client, collection, cs, ce, out_dir, manifest_path, manifest,
                         keep_nc=args.keep_nc, resolution_deg=args.resolution_deg,
-                        radius_of_influence_m=args.radius_of_influence_m): cs
+                        radius_of_influence_m=args.radius_of_influence_m,
+                        s3_client=s3_client, s3_bucket=args.s3_bucket, s3_prefix=args.s3_prefix): cs
             for cs, ce in chunks
         }
         for future in as_completed(futures):
