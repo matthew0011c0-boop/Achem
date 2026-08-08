@@ -34,10 +34,21 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import boto3
 import earthaccess
 from harmony import BBox, Client, Collection, Environment, Request
 
-from tempo_common import CO_BBOX, DEFAULT_SHORT_NAME, MISSION_DATA_START, month_chunks, resolve_concept_id
+from tempo_common import (
+    CO_BBOX,
+    DEFAULT_BUCKET,
+    DEFAULT_BUCKET_PREFIX,
+    DEFAULT_SHORT_NAME,
+    MISSION_DATA_START,
+    bucket_has_month,
+    month_chunks,
+    resolve_concept_id,
+    upload_month_to_bucket,
+)
 
 MANIFEST_LOCK = threading.Lock()
 
@@ -68,6 +79,9 @@ def process_chunk(
     out_dir: Path,
     manifest_path: Path,
     manifest: dict,
+    s3_client=None,
+    bucket: str | None = None,
+    bucket_prefix: str = DEFAULT_BUCKET_PREFIX,
     max_retries: int = 3,
 ) -> str:
     key = chunk_start.isoformat()
@@ -75,6 +89,19 @@ def process_chunk(
 
     if entry.get("status") == "done":
         return f"{key}: already done ({len(entry.get('files', []))} files), skipping"
+
+    # Bucket-first check: this is what lets the pipeline be safely stopped
+    # ("off") and resumed ("on") later, even from a machine with no local
+    # disk state - the bucket, not the local manifest, is the source of
+    # truth for what's already downloaded.
+    if s3_client is not None and bucket:
+        existing_keys = bucket_has_month(s3_client, bucket, bucket_prefix, chunk_start)
+        if existing_keys:
+            entry["status"] = "done"
+            entry["s3_keys"] = existing_keys
+            entry.pop("error", None)
+            save_manifest(manifest_path, manifest)
+            return f"{key}: already in s3://{bucket}/ ({len(existing_keys)} file(s)), skipping download"
 
     dest = out_dir / f"{chunk_start.year:04d}" / f"{chunk_start.month:02d}"
     dest.mkdir(parents=True, exist_ok=True)
@@ -111,8 +138,15 @@ def process_chunk(
             entry["status"] = "done"
             entry["files"] = files
             entry.pop("error", None)
+
+            upload_note = ""
+            if s3_client is not None and bucket:
+                s3_keys = upload_month_to_bucket(s3_client, bucket, bucket_prefix, chunk_start, files)
+                entry["s3_keys"] = s3_keys
+                upload_note = f", uploaded to s3://{bucket}/"
+
             save_manifest(manifest_path, manifest)
-            return f"{key}: downloaded {len(files)} file(s) -> {dest}"
+            return f"{key}: downloaded {len(files)} file(s) -> {dest}{upload_note}"
         except Exception as exc:  # noqa: BLE001 - retry loop, want to catch broadly
             last_err = exc
             entry["status"] = "retrying"
@@ -139,6 +173,14 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, default=None,
                          help="Manifest path (default: <out-dir>/manifest.json)")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent Harmony jobs (default: 4)")
+    parser.add_argument("--bucket", default=DEFAULT_BUCKET,
+                         help=f"S3 bucket checked first for already-downloaded months, and that "
+                              f"finished months are uploaded to (default: {DEFAULT_BUCKET})")
+    parser.add_argument("--bucket-prefix", default=DEFAULT_BUCKET_PREFIX,
+                         help=f"Key prefix within the bucket (default: {DEFAULT_BUCKET_PREFIX})")
+    parser.add_argument("--no-bucket", action="store_true",
+                         help="Disable S3 entirely; fall back to the local manifest only "
+                              "(this turns off the on/off resume-from-bucket behavior).")
     args = parser.parse_args()
 
     if args.end < args.start:
@@ -158,18 +200,27 @@ def main() -> int:
     collection = Collection(id=concept_id)
     client = Client(env=Environment.PROD)
 
+    s3_client = None if args.no_bucket else boto3.client("s3")
+
     manifest = load_manifest(manifest_path)
     chunks = list(month_chunks(args.start, args.end))
     print(f"Processing {len(chunks)} month(s) from {args.start} to {args.end} "
           f"with {args.workers} concurrent Harmony job(s).")
-    print(f"Colorado bbox: {CO_BBOX}")
+    print(f"Colorado + DJ Basin bbox: {CO_BBOX}")
     print(f"Output dir: {out_dir}")
     print(f"Manifest: {manifest_path}")
+    if s3_client is not None:
+        print(f"Bucket (checked first, resumed from): s3://{args.bucket}/{args.bucket_prefix}/")
+    else:
+        print("Bucket checks disabled (--no-bucket); resuming from local manifest only.")
 
     failures = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(process_chunk, client, collection, cs, ce, out_dir, manifest_path, manifest): cs
+            pool.submit(
+                process_chunk, client, collection, cs, ce, out_dir, manifest_path, manifest,
+                s3_client, args.bucket, args.bucket_prefix,
+            ): cs
             for cs, ce in chunks
         }
         for future in as_completed(futures):

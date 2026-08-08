@@ -1,12 +1,19 @@
-# TEMPO NO2 Colorado Downloader
+# TEMPO NO2 Colorado + DJ Basin Downloader
 
-Downloads the full TEMPO NO2 L2 archive, subset to Colorado, using NASA's
-Harmony service to clip each granule server-side before it's transferred.
-This is what makes downloading years of hourly satellite data feasible in
-a few hours instead of requiring multiple terabytes of bandwidth: TEMPO's
-L2 granules cover almost all of North America per scan, so without
-server-side subsetting "Colorado data" is effectively the entire archive
-(~2-4 TB for 2023-2026). Harmony subsetting cuts that by ~95%+.
+Downloads the full TEMPO NO2 L2 archive, subset to a box covering Colorado
+and the Denver-Julesburg (DJ/Julesburg) Basin, using NASA's Harmony service
+to clip each granule server-side before it's transferred. This is what makes
+downloading years of hourly satellite data feasible in a few hours instead
+of requiring multiple terabytes of bandwidth: TEMPO's L2 granules cover
+almost all of North America per scan, so without server-side subsetting
+"regional data" is effectively the entire archive (~2-4 TB for 2023-2026).
+Harmony subsetting cuts that by ~95%+.
+
+Downloaded months are checked into an S3 bucket, which is the pipeline's
+source of truth for what's already done. That's what lets the whole thing
+be turned off (stopped, killed, machine reclaimed) and back on (re-run,
+possibly on a completely fresh machine with an empty local disk) without
+ever re-downloading a month that's already in the bucket.
 
 ## 1. Setup
 
@@ -23,6 +30,10 @@ prompted again.
 If you don't have an Earthdata account yet, create one first at
 https://urs.earthdata.nasa.gov/users/new
 
+AWS credentials for the S3 bucket are picked up from the default AWS
+credential chain (env vars, `~/.aws/credentials`, an IAM role, etc.) - no
+secrets are stored in this repo.
+
 ## 2. Run
 
 ```bash
@@ -31,13 +42,22 @@ python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07
 
 - Splits the date range into one Harmony subsetting job per calendar
   month, and runs several jobs concurrently (`--workers`, default 4).
-- Each job asks Harmony to return only pixels inside the Colorado
-  bounding box (`scripts/tempo_common.py:CO_BBOX`).
-- Files land in `data/tempo_no2_co/<year>/<month>/`.
-- Progress and per-month status are checkpointed to
-  `data/tempo_no2_co/manifest.json`. If the script is interrupted or a
-  month fails, just re-run the same command — completed months are
-  skipped and only unfinished/failed months are retried.
+- Each job asks Harmony to return only pixels inside the Colorado + DJ
+  Basin bounding box (`scripts/tempo_common.py:CO_BBOX`).
+- **Before submitting a Harmony job for a month, the script checks the S3
+  bucket first** (`s3://matt-achem-bucket2/tempo_no2_co/<year>/<month>/`
+  by default). If that month's files are already there, it's marked done
+  and skipped - no Harmony job, no re-download. This is the on/off
+  behavior: stop the script anytime, and whenever/wherever it's next run,
+  already-downloaded months are recognized from the bucket, not just the
+  local manifest.
+- Files land locally in `data/tempo_no2_co/<year>/<month>/`, then are
+  uploaded to the S3 bucket under the same `<year>/<month>/` layout.
+- Progress and per-month status are also checkpointed locally to
+  `data/tempo_no2_co/manifest.json` as a fast local cache. If the script is
+  interrupted or a month fails, just re-run the same command - completed
+  months are skipped (from the bucket if the local manifest is gone) and
+  only unfinished/failed months are retried.
 
 Useful flags:
 
@@ -48,19 +68,32 @@ python scripts/download_tempo_no2_co.py --start 2024-06-01 --end 2024-06-30
 # More concurrent Harmony jobs (faster, but Harmony may throttle/queue)
 python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07 --workers 8
 
-# Different TEMPO product (e.g. HCHO) using the same CO bbox pipeline
+# Different TEMPO product (e.g. HCHO) using the same bbox pipeline
 python scripts/download_tempo_no2_co.py --short-name TEMPO_HCHO_L2 --start 2023-08-01 --end 2026-08-07
+
+# Point at a different bucket/prefix
+python scripts/download_tempo_no2_co.py --bucket my-other-bucket --bucket-prefix tempo_no2
+
+# Disable bucket checks entirely (local manifest only, original behavior)
+python scripts/download_tempo_no2_co.py --no-bucket
 ```
 
 ## Notes / troubleshooting
 
 - **"INVALID REQUEST" errors**: means the resolved collection doesn't
   support Harmony bbox subsetting. Check the error message printed (also
-  saved in the manifest) — it usually names the missing capability.
+  saved in the manifest) - it usually names the missing capability.
 - **Rate limiting / throttling**: Harmony queues jobs server-side; lower
   `--workers` if you see repeated retries.
-- **Resuming**: safe to kill (Ctrl-C) and re-run at any time; the
-  manifest tracks per-month state (`pending` / `submitted` / `retrying` /
-  `done` / `failed`).
-- Downloaded data and the manifest are gitignored — this repo holds the
+- **Resuming ("on/off")**: safe to kill (Ctrl-C) and re-run at any time;
+  each month's presence in the S3 bucket is checked before doing any work,
+  so a month already uploaded is never redownloaded even if local state
+  (manifest, `data/`) is missing. The local manifest tracks finer-grained
+  per-month state (`pending` / `submitted` / `retrying` / `done` / `failed`)
+  for the current machine.
+- **S3 errors**: if the bucket can't be listed/written to (bad credentials,
+  missing permissions, bucket doesn't exist), the script raises a clear
+  error naming the bucket/prefix. Pass `--no-bucket` to fall back to
+  local-only operation.
+- Downloaded data and the manifest are gitignored - this repo holds the
   pipeline code, not the satellite data itself.
