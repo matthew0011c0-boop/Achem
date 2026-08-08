@@ -62,12 +62,12 @@ python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07
 - Each job asks Harmony to return only pixels inside the Colorado + DJ
   Basin bounding box (`scripts/tempo_common.py:CO_BBOX`).
 - **Before submitting a Harmony job for a month, the script checks the S3
-  bucket first** (`s3://matt-achem-bucket2/tempo_no2_co/<year>/<month>/`
-  by default). If that month's files are already there, it's marked done
-  and skipped - no Harmony job, no re-download. This is the on/off
-  behavior: stop the script anytime, and whenever/wherever it's next run,
-  already-downloaded months are recognized from the bucket, not just the
-  local manifest.
+  bucket first** (`s3://matt-achem-bucket2/tempo_no2_co/nc/<year>/<month>/`
+  and `.../tiffs/<year>/<month>/` by default). If that month's files are
+  already there, it's marked done and skipped - no Harmony job, no
+  re-download. This is the on/off behavior: stop the script anytime, and
+  whenever/wherever it's next run, already-downloaded months are
+  recognized from the bucket, not just the local manifest.
 - Files land locally in `data/tempo_no2_co/<year>/<month>/` as the raw
   Harmony-subsetted NetCDF granules.
 - **Each granule is then regridded onto a fixed 1km x 1km grid** (EPSG:5070,
@@ -78,8 +78,15 @@ python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07
   2. `no2_stratosphere` - NO2 stratospheric vertical column
   3. `qc_flag` - main data quality flag
   4. `cloud_fraction` - effective cloud fraction
-- Both the raw `.nc` and the regridded `.tif` are uploaded to the S3 bucket
-  under the same `<year>/<month>/` layout.
+- Both the raw `.nc` and the regridded `.tif` are uploaded to the S3 bucket,
+  split by file type into separate `nc/<year>/<month>/` and
+  `tiffs/<year>/<month>/` folders (each still organized by year/month
+  underneath). Sort files already in the bucket into this layout with:
+
+  ```bash
+  python scripts/sort_bucket_by_filetype.py --dry-run   # preview
+  python scripts/sort_bucket_by_filetype.py              # actually move them
+  ```
 - Progress and per-month status are also checkpointed locally to
   `data/tempo_no2_co/manifest.json` as a fast local cache. If the script is
   interrupted or a month fails, just re-run the same command - completed

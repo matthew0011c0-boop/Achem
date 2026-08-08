@@ -29,6 +29,22 @@ MISSION_DATA_START = dt.date(2023, 8, 1)
 DEFAULT_BUCKET = "matt-achem-bucket2"
 DEFAULT_BUCKET_PREFIX = "tempo_no2_co"
 
+# Top-level split within the bucket prefix: raw NetCDF granules and
+# regridded GeoTIFFs land in separate folders (each still organized into
+# <year>/<month>/ underneath), instead of being mixed together.
+NC_SUBDIR = "nc"
+TIF_SUBDIR = "tiffs"
+
+
+def _kind_for(filename: str) -> str:
+    """Which bucket subfolder a file belongs in, based on its extension."""
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if suffix in ("nc", "nc4"):
+        return NC_SUBDIR
+    if suffix in ("tif", "tiff"):
+        return TIF_SUBDIR
+    raise ValueError(f"Don't know which bucket folder {filename!r} belongs in (unrecognized extension)")
+
 
 def resolve_concept_id(short_name: str = DEFAULT_SHORT_NAME) -> str:
     """Look up the current CMR concept-id for a TEMPO short_name.
@@ -61,9 +77,9 @@ def month_chunks(start: dt.date, end: dt.date):
         cur = nxt
 
 
-def month_prefix(bucket_prefix: str, chunk_start: dt.date) -> str:
-    """S3 key prefix a given month's files are stored under."""
-    return f"{bucket_prefix.rstrip('/')}/{chunk_start.year:04d}/{chunk_start.month:02d}/"
+def month_prefix(bucket_prefix: str, kind: str, chunk_start: dt.date) -> str:
+    """S3 key prefix a given month's files of one kind (nc/tiffs) are stored under."""
+    return f"{bucket_prefix.rstrip('/')}/{kind}/{chunk_start.year:04d}/{chunk_start.month:02d}/"
 
 
 def bucket_has_month(s3_client, bucket: str, bucket_prefix: str, chunk_start: dt.date) -> list[str]:
@@ -71,27 +87,33 @@ def bucket_has_month(s3_client, bucket: str, bucket_prefix: str, chunk_start: dt
 
     This is the "check the bucket first" step: it lets a stopped/restarted
     run (even on a fresh machine with no local disk state) recognize work
-    that's already done without re-hitting Harmony.
+    that's already done without re-hitting Harmony. Checks both the nc/ and
+    tiffs/ subfolders for the month.
     """
-    prefix = month_prefix(bucket_prefix, chunk_start)
-    try:
-        resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    except (ClientError, NoCredentialsError) as exc:
-        raise RuntimeError(
-            f"Could not list s3://{bucket}/{prefix} - check AWS credentials/permissions "
-            f"(or pass --no-bucket to disable bucket checks): {exc}"
-        ) from exc
-    return [obj["Key"] for obj in resp.get("Contents", [])]
+    keys = []
+    for kind in (NC_SUBDIR, TIF_SUBDIR):
+        prefix = month_prefix(bucket_prefix, kind, chunk_start)
+        try:
+            resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        except (ClientError, NoCredentialsError) as exc:
+            raise RuntimeError(
+                f"Could not list s3://{bucket}/{prefix} - check AWS credentials/permissions "
+                f"(or pass --no-bucket to disable bucket checks): {exc}"
+            ) from exc
+        keys.extend(obj["Key"] for obj in resp.get("Contents", []))
+    return keys
 
 
 def upload_month_to_bucket(
     s3_client, bucket: str, bucket_prefix: str, chunk_start: dt.date, local_files: list[str]
 ) -> list[str]:
-    """Upload downloaded files for a month to S3 so the bucket becomes the durable record."""
-    prefix = month_prefix(bucket_prefix, chunk_start)
+    """Upload downloaded files for a month to S3, split into nc/ and tiffs/ so the
+    bucket becomes the durable record. Each keeps its <year>/<month>/ layout underneath."""
     keys = []
     for local_path in local_files:
-        key = prefix + local_path.rsplit("/", 1)[-1]
+        filename = local_path.rsplit("/", 1)[-1]
+        kind = _kind_for(filename)
+        key = month_prefix(bucket_prefix, kind, chunk_start) + filename
         try:
             s3_client.upload_file(local_path, bucket, key)
         except (ClientError, NoCredentialsError) as exc:
