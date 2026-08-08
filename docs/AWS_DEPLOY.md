@@ -25,6 +25,28 @@ running from elsewhere.
 Substitute your own values for `<ACCOUNT_ID>` and adjust `us-west-2` if
 you deploy elsewhere.
 
+**IAM user for automation**: if you're running these steps via a
+dedicated IAM user (access key + secret, not your root/console login),
+that user needs permissions attached before any of this works - an IAM
+user with no policy attached can authenticate (`sts:get-caller-identity`
+always succeeds) but every real action will be `AccessDenied`. See
+[`claude-login-policy.json`](claude-login-policy.json) for the exact
+least-privilege policy this project needs (S3 scoped to
+`matt-achem-bucket2/tempo_no2_co/*`, IAM scoped to the two
+`achem-tempo-*` resources this guide creates, ECR scoped to the
+`achem-tempo` repo, Secrets Manager scoped to `achem/earthdata/*`; EC2
+and the initial ECR/SSM lookups can't be scoped to not-yet-existing
+resources so those stay account-wide). Attach it with:
+
+```bash
+aws iam put-user-policy --user-name <IAM_USER_NAME> \
+  --policy-name achem-tempo-deploy \
+  --policy-document file://docs/claude-login-policy.json
+```
+
+This has to be run by someone with IAM admin rights on the account - an
+IAM user cannot grant itself permissions it doesn't already have.
+
 ## 1. Build and push the image to ECR
 
 ```bash
