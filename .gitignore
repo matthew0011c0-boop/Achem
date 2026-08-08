@@ -11,3 +11,4 @@ secrets/*
 __pycache__/
 *.pyc
 .venv/
+setup_credentials.sh
