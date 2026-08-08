@@ -50,6 +50,23 @@ IAM user cannot grant itself permissions it doesn't already have.
 ## 1. Build and push the image to ECR
 
 ```bash
+./scripts/ecr_push.sh
+```
+
+Resolves your account ID via `aws sts get-caller-identity` (no
+`<ACCOUNT_ID>` to substitute by hand) and always builds from the repo
+root regardless of your current directory, so it can't fail the way
+copy-pasting these commands from a shell in the wrong directory can.
+Creates the `achem-tempo` ECR repo first if it doesn't already exist.
+Override the region or repo name with `AWS_REGION`/`REPO_NAME` env vars
+if needed.
+
+Equivalent manual steps, if you'd rather run them yourself (replace
+`<ACCOUNT_ID>` with your real account ID, e.g. from
+`aws sts get-caller-identity --query Account --output text`, and run
+`docker build` from the repo root):
+
+```bash
 aws ecr create-repository --repository-name achem-tempo --region us-west-2
 
 aws ecr get-login-password --region us-west-2 \
