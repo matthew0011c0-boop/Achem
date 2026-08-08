@@ -1,0 +1,23 @@
+{
+  "jobDefinitionName": "tempo-no2-co-downloader",
+  "type": "container",
+  "platformCapabilities": ["FARGATE"],
+  "containerProperties": {
+    "image": "REPLACE_WITH_ECR_IMAGE_URI",
+    "executionRoleArn": "REPLACE_WITH_ECS_TASK_EXECUTION_ROLE_ARN",
+    "jobRoleArn": "REPLACE_WITH_TASK_ROLE_ARN",
+    "resourceRequirements": [
+      { "type": "VCPU", "value": "2" },
+      { "type": "MEMORY", "value": "4096" }
+    ],
+    "networkConfiguration": { "assignPublicIp": "ENABLED" },
+    "environment": [
+      { "name": "S3_BUCKET", "value": "REPLACE_WITH_BUCKET_NAME" },
+      { "name": "S3_PREFIX", "value": "tempo_no2_co" },
+      { "name": "EARTHDATA_SECRET_ID", "value": "REPLACE_WITH_EARTHDATA_SECRET_ARN" },
+      { "name": "WORKERS", "value": "8" }
+    ]
+  },
+  "retryStrategy": { "attempts": 2 },
+  "timeout": { "attemptDurationSeconds": 14400 }
+}
