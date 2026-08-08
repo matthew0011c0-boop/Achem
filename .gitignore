@@ -4,6 +4,10 @@ data/
 *.log
 manifest.json
 .netrc
+secrets/*
+!secrets/*.example
+*.pem
+*.key
 __pycache__/
 *.pyc
 .venv/

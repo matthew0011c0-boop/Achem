@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Download TEMPO NO2 L2 data over Colorado, fast.
+"""Download TEMPO NO2 L2 data over Colorado + the DJ Basin, fast.
 
 Strategy: instead of pulling full continent-wide L2 granules (multi-TB for
 the full mission), we ask NASA's Harmony service to spatially subset each
-granule to a Colorado bounding box *before* it leaves NASA's servers. That
+granule to a regional bounding box *before* it leaves NASA's servers. That
 cuts per-file size by ~95%+, which is what makes "download the whole TEMPO
-NO2 archive for Colorado in a few hours" realistic.
+NO2 archive for this region in a few hours" realistic.
 
 The date range is split into one Harmony job per calendar month and jobs
 are processed concurrently (submit + wait + download), so we're not
-waiting on one giant serial job. Progress is checkpointed to a manifest
-file so the script can be killed and re-run without redoing finished
-months.
+waiting on one giant serial job. Each downloaded granule is then regridded
+onto a fixed 1km x 1km GeoTIFF (NO2 troposphere/stratosphere, QC flag,
+cloud fraction - see regrid_to_geotiff.py) and both files are uploaded to
+S3. Before doing any of this for a given month, the S3 bucket is checked
+first - if that month is already there, the whole month is skipped. That
+bucket check (not just the local manifest) is what makes the pipeline safe
+to stop and restart from any machine.
 
 Usage:
     python scripts/download_tempo_no2_co.py --start 2023-08-01 --end 2026-08-07
@@ -34,12 +38,56 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import boto3
 import earthaccess
 from harmony import BBox, Client, Collection, Environment, Request
 
-from tempo_common import CO_BBOX, DEFAULT_SHORT_NAME, MISSION_DATA_START, month_chunks, resolve_concept_id
+from regrid_to_geotiff import regrid_file
+from tempo_common import (
+    CO_BBOX,
+    DEFAULT_BUCKET,
+    DEFAULT_BUCKET_PREFIX,
+    DEFAULT_SHORT_NAME,
+    MISSION_DATA_START,
+    bucket_has_month,
+    month_chunks,
+    resolve_concept_id,
+    upload_month_to_bucket,
+)
 
 MANIFEST_LOCK = threading.Lock()
+
+# Harmony auto-pauses jobs above a certain size as a safety check. The
+# harmony-py client's own wait_for_processing() treats "paused" as a stop
+# condition - it just prints a message and returns, leaving whatever
+# fraction of the job ran before the pause as if it were the final result.
+# For a month-sized request that silently truncates a month's worth of
+# granules down to whatever trickled through before the pause. Poll and
+# resume ourselves instead so we actually wait for real completion.
+MAX_RESUMES = 20
+
+
+def wait_for_processing_resuming(client: Client, job_id: str) -> None:
+    resumes = 0
+    progress = 0
+    while progress < 100:
+        progress, status, message = client.progress(job_id)
+        if status == "failed":
+            raise RuntimeError(f"Harmony job {job_id} failed: {message}")
+        if status == "canceled":
+            raise RuntimeError(f"Harmony job {job_id} was canceled: {message}")
+        if status in ("successful", "complete_with_errors"):
+            return
+        if status == "paused":
+            resumes += 1
+            if resumes > MAX_RESUMES:
+                raise RuntimeError(
+                    f"Harmony job {job_id} paused {resumes} times without completing - "
+                    f"giving up rather than looping forever."
+                )
+            client.resume(job_id)
+            continue
+        time.sleep(client.check_interval)
 
 
 def load_manifest(path: Path) -> dict:
@@ -68,6 +116,9 @@ def process_chunk(
     out_dir: Path,
     manifest_path: Path,
     manifest: dict,
+    s3_client=None,
+    bucket: str | None = None,
+    bucket_prefix: str = DEFAULT_BUCKET_PREFIX,
     max_retries: int = 3,
 ) -> str:
     key = chunk_start.isoformat()
@@ -75,6 +126,19 @@ def process_chunk(
 
     if entry.get("status") == "done":
         return f"{key}: already done ({len(entry.get('files', []))} files), skipping"
+
+    # Bucket-first check: this is what lets the pipeline be safely stopped
+    # ("off") and resumed ("on") later, even from a machine with no local
+    # disk state - the bucket, not the local manifest, is the source of
+    # truth for what's already downloaded.
+    if s3_client is not None and bucket:
+        existing_keys = bucket_has_month(s3_client, bucket, bucket_prefix, chunk_start)
+        if existing_keys:
+            entry["status"] = "done"
+            entry["s3_keys"] = existing_keys
+            entry.pop("error", None)
+            save_manifest(manifest_path, manifest)
+            return f"{key}: already in s3://{bucket}/ ({len(existing_keys)} file(s)), skipping download"
 
     dest = out_dir / f"{chunk_start.year:04d}" / f"{chunk_start.month:02d}"
     dest.mkdir(parents=True, exist_ok=True)
@@ -102,17 +166,51 @@ def process_chunk(
             entry["job_id"] = job_id
             save_manifest(manifest_path, manifest)
 
-            client.wait_for_processing(job_id, show_progress=False)
+            wait_for_processing_resuming(client, job_id)
 
             files = []
             for future in client.download_all(job_id, directory=str(dest), overwrite=False):
                 files.append(str(future.result()))
 
+            # Defense in depth against a repeat of the Harmony-pause bug (or any other
+            # failure mode that returns a partial result without erroring): cross-check
+            # the download count against CMR's own count for the identical collection +
+            # bbox + date window before ever calling this month "done". A silent partial
+            # month would otherwise look complete forever, since the bucket-first check
+            # only asks "does anything exist here", not "is everything here".
+            expected = (
+                earthaccess.DataGranules()
+                .concept_id(collection.id)
+                .bounding_box(*CO_BBOX)
+                .temporal(chunk_start.isoformat(), chunk_end.isoformat())
+                .hits()
+            )
+            if expected > 0 and len(files) < expected * 0.95:
+                raise RuntimeError(
+                    f"Got {len(files)} file(s) but CMR reports {expected} granule(s) exist "
+                    f"for this window - Harmony likely returned a partial result (e.g. an "
+                    f"auto-paused job). Not marking this month done."
+                )
+
+            tif_files = []
+            for nc_file in files:
+                if Path(nc_file).suffix.lower() in (".nc", ".nc4"):
+                    tif_files.append(str(regrid_file(Path(nc_file))))
+
             entry["status"] = "done"
             entry["files"] = files
+            entry["tif_files"] = tif_files
             entry.pop("error", None)
+
+            upload_note = ""
+            if s3_client is not None and bucket:
+                s3_keys = upload_month_to_bucket(s3_client, bucket, bucket_prefix, chunk_start, files + tif_files)
+                entry["s3_keys"] = s3_keys
+                upload_note = f", uploaded to s3://{bucket}/"
+
             save_manifest(manifest_path, manifest)
-            return f"{key}: downloaded {len(files)} file(s) -> {dest}"
+            return (f"{key}: downloaded {len(files)} file(s), regridded {len(tif_files)} to 1km GeoTIFF "
+                    f"-> {dest}{upload_note}")
         except Exception as exc:  # noqa: BLE001 - retry loop, want to catch broadly
             last_err = exc
             entry["status"] = "retrying"
@@ -139,6 +237,14 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, default=None,
                          help="Manifest path (default: <out-dir>/manifest.json)")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent Harmony jobs (default: 4)")
+    parser.add_argument("--bucket", default=DEFAULT_BUCKET,
+                         help=f"S3 bucket checked first for already-downloaded months, and that "
+                              f"finished months are uploaded to (default: {DEFAULT_BUCKET})")
+    parser.add_argument("--bucket-prefix", default=DEFAULT_BUCKET_PREFIX,
+                         help=f"Key prefix within the bucket (default: {DEFAULT_BUCKET_PREFIX})")
+    parser.add_argument("--no-bucket", action="store_true",
+                         help="Disable S3 entirely; fall back to the local manifest only "
+                              "(this turns off the on/off resume-from-bucket behavior).")
     args = parser.parse_args()
 
     if args.end < args.start:
@@ -158,18 +264,27 @@ def main() -> int:
     collection = Collection(id=concept_id)
     client = Client(env=Environment.PROD)
 
+    s3_client = None if args.no_bucket else boto3.client("s3")
+
     manifest = load_manifest(manifest_path)
     chunks = list(month_chunks(args.start, args.end))
     print(f"Processing {len(chunks)} month(s) from {args.start} to {args.end} "
           f"with {args.workers} concurrent Harmony job(s).")
-    print(f"Colorado bbox: {CO_BBOX}")
+    print(f"Colorado + DJ Basin bbox: {CO_BBOX}")
     print(f"Output dir: {out_dir}")
     print(f"Manifest: {manifest_path}")
+    if s3_client is not None:
+        print(f"Bucket (checked first, resumed from): s3://{args.bucket}/{args.bucket_prefix}/")
+    else:
+        print("Bucket checks disabled (--no-bucket); resuming from local manifest only.")
 
     failures = 0
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(process_chunk, client, collection, cs, ce, out_dir, manifest_path, manifest): cs
+            pool.submit(
+                process_chunk, client, collection, cs, ce, out_dir, manifest_path, manifest,
+                s3_client, args.bucket, args.bucket_prefix,
+            ): cs
             for cs, ce in chunks
         }
         for future in as_completed(futures):
