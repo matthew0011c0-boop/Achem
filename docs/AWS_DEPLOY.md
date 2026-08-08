@@ -268,6 +268,19 @@ This costs about the same as one month's worth of downloading either way
 (same 3 months of data get pulled once, just arranged differently), so
 it's a cheap real answer instead of a guess.
 
+**Gotcha if you shrink the windows below a full month** (e.g. testing with
+single days instead of whole months, to run a cheaper/faster benchmark):
+`bucket_has_month()` checks the bucket at **month** granularity
+(`tempo_no2_co/<year>/<month>/`), not per-day. If two of your test windows
+fall in the *same* calendar month - even on different days, even in
+different jobs - whichever one uploads first will make every other
+same-month job see "this month already has files" and skip without doing
+any real work, silently invalidating the comparison. Confirmed this the
+hard way: a 9-job test using 9 different days *within the same month*
+finished in 10 seconds because job 1's upload made jobs 2-9 immediately
+short-circuit. Fix is the one already used above - give every window
+(baseline included) its own distinct calendar month.
+
 ## Alternative: AWS Batch
 
 For something more managed (automatic retry on failure, no manual instance
