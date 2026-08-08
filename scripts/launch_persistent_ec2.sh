@@ -11,12 +11,19 @@
 #
 # Requires: the image already pushed to ECR (run scripts/ecr_push.sh
 # first) and an Earthdata secret already created in Secrets Manager
-# (see docs/AWS_DEPLOY.md step 2).
+# (see docs/AWS_DEPLOY.md step 2) - only its "password" field is used; that
+# one password is shared across every account in ACCOUNTS.
+#
+# ACCOUNTS defaults to all three known Earthdata logins, all run
+# concurrently inside this one container (see
+# scripts/download_tempo_no2_co_multi.py) - set ACCOUNTS=matthew0011c0 for
+# the old single-account behavior.
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
 REPO_NAME="${REPO_NAME:-achem-tempo}"
 SECRET_ID="${SECRET_ID:-achem/earthdata/matthew0011c0}"
+ACCOUNTS="${ACCOUNTS:-matthew0011c0,matthew0011c1,matthew0011c2}"
 START="${START:-2023-08-01}"
 END="${END:-$(date +%F)}"
 WORKERS="${WORKERS:-4}"
@@ -81,11 +88,10 @@ aws ecr get-login-password --region "$REGION" \
   | docker login --username AWS --password-stdin "$REGISTRY"
 
 CREDS=\$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" --query SecretString --output text)
-EARTHDATA_USERNAME=\$(python3 -c "import json,sys;print(json.load(sys.stdin)['username'])" <<< "\$CREDS")
 EARTHDATA_PASSWORD=\$(python3 -c "import json,sys;print(json.load(sys.stdin)['password'])" <<< "\$CREDS")
 
 docker run -d --name achem-tempo --restart unless-stopped \
-  -e EARTHDATA_USERNAME="\$EARTHDATA_USERNAME" -e EARTHDATA_PASSWORD="\$EARTHDATA_PASSWORD" \
+  -e EARTHDATA_ACCOUNTS="$ACCOUNTS" -e EARTHDATA_PASSWORD="\$EARTHDATA_PASSWORD" \
   "$REGISTRY/$REPO_NAME:latest" --start "$START" --end "$END" --workers "$WORKERS"
 EOF
 )

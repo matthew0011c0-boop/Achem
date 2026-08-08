@@ -1,20 +1,17 @@
 #!/bin/sh
-# Provisions ~/.netrc from EARTHDATA_USERNAME/EARTHDATA_PASSWORD env vars
-# (e.g. injected from AWS Secrets Manager into the container) before running
-# the downloader. If those env vars aren't set, falls through and relies on
-# whatever ~/.netrc already exists (e.g. a local dev container with a
-# mounted netrc) - both earthaccess and harmony-py read it the same way
-# either way, so no Python code needs to know which case it's in.
+# Two modes, both authenticating straight from env vars (no ~/.netrc file,
+# since a shared file would race between concurrent multi-account runs):
+#
+# - EARTHDATA_ACCOUNTS set (comma-separated usernames) + EARTHDATA_PASSWORD
+#   (one password shared by all of them): runs download_tempo_no2_co_multi.py,
+#   which fans out one subprocess per account, each covering a slice of the
+#   date range, all in this one container.
+# - Otherwise, EARTHDATA_USERNAME + EARTHDATA_PASSWORD (single account):
+#   runs download_tempo_no2_co.py directly.
 set -eu
 
-if [ -n "${EARTHDATA_USERNAME:-}" ] && [ -n "${EARTHDATA_PASSWORD:-}" ]; then
-  netrc="${HOME:-/root}/.netrc"
-  cat > "$netrc" <<EOF
-machine urs.earthdata.nasa.gov
-  login ${EARTHDATA_USERNAME}
-  password ${EARTHDATA_PASSWORD}
-EOF
-  chmod 600 "$netrc"
+if [ -n "${EARTHDATA_ACCOUNTS:-}" ]; then
+  exec python scripts/download_tempo_no2_co_multi.py --accounts "$EARTHDATA_ACCOUNTS" "$@"
 fi
 
 exec python scripts/download_tempo_no2_co.py "$@"

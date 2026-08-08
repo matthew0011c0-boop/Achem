@@ -61,6 +61,32 @@ def month_chunks(start: dt.date, end: dt.date):
         cur = nxt
 
 
+def split_range_by_month(start: dt.date, end: dt.date, n: int) -> list[tuple[dt.date, dt.date]]:
+    """Split [start, end] into up to n contiguous, calendar-month-aligned sub-ranges.
+
+    Used to divide work across multiple Earthdata accounts running
+    concurrently. Splitting on month boundaries (not raw days) matters
+    because the bucket-first resume check operates at month granularity -
+    two accounts whose ranges overlapped mid-month could race to claim
+    the same month (see the AWS_DEPLOY.md gotcha about same-month test
+    windows). Returns fewer than n ranges if there are fewer than n months
+    in [start, end].
+    """
+    months = list(month_chunks(start, end))
+    if not months:
+        return []
+    n = min(n, len(months))
+    base, extra = divmod(len(months), n)
+    ranges = []
+    idx = 0
+    for i in range(n):
+        count = base + (1 if i < extra else 0)
+        group = months[idx : idx + count]
+        idx += count
+        ranges.append((group[0][0], group[-1][1]))
+    return ranges
+
+
 def month_prefix(bucket_prefix: str, chunk_start: dt.date) -> str:
     """S3 key prefix a given month's files are stored under."""
     return f"{bucket_prefix.rstrip('/')}/{chunk_start.year:04d}/{chunk_start.month:02d}/"

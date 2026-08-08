@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -255,14 +256,26 @@ def main() -> int:
     manifest_path = args.manifest or (out_dir / "manifest.json")
 
     print("Checking Earthdata authentication...")
-    auth = earthaccess.login(strategy="netrc")
+    # EARTHDATA_USERNAME/PASSWORD, when set, authenticate straight from the
+    # environment - no ~/.netrc file involved. That matters for
+    # download_tempo_no2_co_multi.py, which runs several accounts as
+    # concurrent subprocesses in one container: a shared netrc file would
+    # race between them (one hostname entry, multiple accounts wanting it).
+    earthdata_username = os.environ.get("EARTHDATA_USERNAME")
+    earthdata_password = os.environ.get("EARTHDATA_PASSWORD")
+    if earthdata_username and earthdata_password:
+        auth = earthaccess.login(strategy="environment")
+        harmony_auth = (earthdata_username, earthdata_password)
+    else:
+        auth = earthaccess.login(strategy="netrc")
+        harmony_auth = None
     if not auth.authenticated:
         print("Not authenticated. Run scripts/setup_earthdata_auth.py first.", file=sys.stderr)
         return 1
 
     concept_id = resolve_concept_id(args.short_name)
     collection = Collection(id=concept_id)
-    client = Client(env=Environment.PROD)
+    client = Client(env=Environment.PROD, auth=harmony_auth)
 
     s3_client = None if args.no_bucket else boto3.client("s3")
 

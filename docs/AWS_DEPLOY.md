@@ -227,7 +227,46 @@ after termination) has the full per-month output. If a run dies partway
 through, just launch it again with the same `--start`/`--end` - the bucket
 check picks up exactly where it left off.
 
-## Splitting across multiple Earthdata accounts
+## Splitting across multiple Earthdata accounts, in one container
+
+`scripts/launch_persistent_ec2.sh` defaults to running **all three**
+Earthdata accounts (`matthew0011c0`, `matthew0011c1`, `matthew0011c2`)
+concurrently inside the single container it launches, sharing **one
+password** - no three separate secrets, no three instances. It works like
+this:
+
+- One Secrets Manager secret (`SECRET_ID`, default
+  `achem/earthdata/matthew0011c0`) supplies the shared password.
+- The container's entrypoint sees `EARTHDATA_ACCOUNTS` (a comma list) is
+  set and runs `scripts/download_tempo_no2_co_multi.py` instead of the
+  single-account script.
+- That script splits `--start`/`--end` into as many contiguous,
+  calendar-month-aligned ranges as there are accounts (see
+  `split_range_by_month` in `tempo_common.py`) and runs one subprocess per
+  account, each authenticating from env vars directly (no `~/.netrc`, so
+  the accounts can't collide with each other) and logging with an
+  `[account-name]` prefix so `docker logs -f achem-tempo` shows all three
+  interleaved in one stream.
+- All three still check/upload against the same S3 bucket, so the result
+  is identical to one long single-account run - just faster, since
+  Harmony's concurrent-job cap is enforced per account.
+
+To use just one account instead (the old default): `ACCOUNTS=matthew0011c0 ./scripts/launch_persistent_ec2.sh`.
+
+To run this manually (e.g. locally, not through the launcher script):
+
+```bash
+EARTHDATA_PASSWORD=REPLACE_ME python scripts/download_tempo_no2_co_multi.py \
+  --accounts matthew0011c0,matthew0011c1,matthew0011c2 \
+  --start 2023-08-01 --end 2026-08-08
+```
+
+### Background: splitting across separate instances instead
+
+The rest of this section describes the older approach - three fully
+separate instances/secrets/date-ranges - which still works and is useful
+if you want the accounts physically isolated (e.g. different security
+boundaries) rather than sharing one container/password.
 
 Whether this actually helps depends on what's limiting you:
 
